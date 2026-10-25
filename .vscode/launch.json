@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:djlibrary}",
+            "name": "Debug DJLibrary",
+            "target": "DJLibrary",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug DJLibrary"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:djlibrary}",
+            "name": "Release DJLibrary",
+            "target": "DJLibrary",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release DJLibrary"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:djlibrary}",
+            "name": "Debug djcheck",
+            "target": "djcheck",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug djcheck"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:djlibrary}",
+            "name": "Release djcheck",
+            "target": "djcheck",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release djcheck"
+        }
+    ]
+}
