@@ -1,5 +1,6 @@
 import AVFoundation
 import Observation
+import DJCore
 import SwiftUI
 
 /// Reproductor de preview de la pista seleccionada.
@@ -75,91 +76,32 @@ final class Player {
 
     func skip(_ delta: Double) { seek(to: currentTime + delta) }
 
+    /// Posición exacta en este instante (para animar la onda a 60 fps sin esperar al observador).
+    var now: Double {
+        if isScrubbing { return currentTime }
+        let t = player.currentTime().seconds
+        return t.isFinite ? t : currentTime
+    }
+
+    func pause() {
+        guard isPlaying else { return }
+        player.pause()
+        isPlaying = false
+        currentTime = now
+    }
+
+    /// Salta a un cue y reproduce, como al pulsar un pad en el deck.
+    func jump(to seconds: Double) {
+        guard url != nil else { return }
+        seek(to: seconds)
+        if !isPlaying {
+            player.play()
+            isPlaying = true
+        }
+    }
+
     func scrubbing(_ active: Bool) {
         isScrubbing = active
         if !active { seek(to: currentTime) }
-    }
-}
-
-struct PlayerBar: View {
-    @Environment(Player.self) private var player
-    @Environment(LibraryModel.self) private var model
-
-    var body: some View {
-        @Bindable var player = player
-        HStack(spacing: 12) {
-            Button { playSelectionOrToggle() } label: {
-                Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").frame(width: 18)
-            }
-            .buttonStyle(.borderless)
-            .help("Reproducir / pausar (espacio)")
-            .disabled(player.url == nil && model.selection.isEmpty)
-
-            Button { player.skip(-10) } label: { Image(systemName: "gobackward.10") }
-                .buttonStyle(.borderless)
-                .disabled(player.url == nil)
-            Button { player.skip(10) } label: { Image(systemName: "goforward.10") }
-                .buttonStyle(.borderless)
-                .disabled(player.url == nil)
-
-            Text(nowPlaying)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(width: 260, alignment: .leading)
-                .foregroundStyle(player.url == nil ? .secondary : .primary)
-
-            Text(format(player.currentTime)).monospacedDigit().foregroundStyle(.secondary)
-            if let url = player.url, let w = model.waveform(for: url), player.duration > 0 {
-                // Onda con cabezal; clic o arrastre para moverse.
-                GeometryReader { geo in
-                    WaveformView(waveform: w, progress: player.currentTime / player.duration)
-                        .contentShape(Rectangle())
-                        .gesture(DragGesture(minimumDistance: 0)
-                            .onChanged { v in
-                                player.scrubbing(true)
-                                player.currentTime = max(0, min(1, v.location.x / geo.size.width)) * player.duration
-                            }
-                            .onEnded { _ in player.scrubbing(false) })
-                }
-                .frame(height: 32)
-            } else {
-                Slider(value: $player.currentTime, in: 0...max(player.duration, 1)) { editing in
-                    player.scrubbing(editing)
-                }
-                .disabled(player.url == nil)
-            }
-            Text(format(player.duration)).monospacedDigit().foregroundStyle(.secondary)
-
-            Button { player.stop() } label: { Image(systemName: "stop.fill") }
-                .buttonStyle(.borderless)
-                .disabled(player.url == nil)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.bar)
-    }
-
-    private var nowPlaying: String {
-        guard let url = player.url else { return "Doble clic o espacio para escuchar" }
-        let item = model.visible.first { $0.id == url }
-        if let item, !item.edited.title.isEmpty {
-            return item.edited.artist.isEmpty ? item.edited.title : "\(item.edited.artist) – \(item.edited.title)"
-        }
-        return url.lastPathComponent
-    }
-
-    /// Si la selección es otra pista, la reproduce; si no, pausa/reanuda.
-    func playSelectionOrToggle() {
-        if let url = model.playTarget, url != player.url {
-            player.play(url)
-        } else {
-            player.toggle()
-        }
-    }
-
-    private func format(_ s: Double) -> String {
-        guard s.isFinite else { return "0:00" }
-        let total = Int(s)
-        return String(format: "%d:%02d", total / 60, total % 60)
     }
 }

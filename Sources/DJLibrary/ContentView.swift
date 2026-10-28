@@ -25,9 +25,9 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 220)
         } detail: {
             VStack(spacing: 0) {
-                TrackTable()
+                DeckView()
                 Divider()
-                PlayerBar()
+                TrackTable()
                 StatusBar()
             }
             .searchable(text: $model.search, prompt: "Buscar")
@@ -57,6 +57,12 @@ struct ContentView: View {
     private var toolbar: some ToolbarContent {
         let noSelection = model.selection.isEmpty
         ToolbarItemGroup {
+            Button { Task { await model.analyzeBPM() } } label: {
+                Label("Analizar BPM", systemImage: "waveform.badge.magnifyingglass")
+            }
+            .help("Detecta BPM entero, cambios de tempo (transiciones), fase y compás. Selección o, sin selección, lo visible.")
+            .disabled(model.analysisProgress != nil)
+
             Menu {
                 Button("÷ 2 (mitad)") { model.scaleBPM(0.5) }
                 Button("× 2 (doble)") { model.scaleBPM(2) }
@@ -106,6 +112,16 @@ struct ContentView: View {
         ToolbarItemGroup {
             Button { model.selectSuspicious() } label: { Label("Seleccionar sospechosos", systemImage: "exclamationmark.triangle") }
                 .help("Selecciona pistas con BPM > 140, < 70 o con decimales")
+            Menu {
+                Button("Exportar ahora") { Task { await model.exportRekordbox() } }
+                    .disabled(model.isExporting)
+                Button("Configurar rekordbox para leer el XML") { model.configureRekordbox() }
+                Divider()
+                Button("Abrir rekordbox") { model.openRekordbox() }
+            } label: {
+                Label("rekordbox", systemImage: "square.and.arrow.up")
+            }
+            .help("rekordbox.xml con pistas, playlists, beatgrid y cues")
             Button { model.revert() } label: { Label("Descartar", systemImage: "arrow.uturn.backward") }
                 .help("Descartar cambios (de la selección, o todos si no hay selección)")
                 .disabled(model.dirtyCount == 0)
@@ -145,7 +161,7 @@ struct TrackTable: View {
 
             TableColumn("Onda") { item in
                 if let w = model.waveform(for: item.id) {
-                    WaveformView(waveform: w).frame(height: 18)
+                    WaveformView(waveform: w, perf: model.performance(for: item.id)).frame(height: 22)
                 }
             }
             .width(min: 80, ideal: 130)
@@ -188,9 +204,13 @@ struct TrackTable: View {
                     if item.bpmChanged, let old = item.original.bpm {
                         Text(TagWriter.formatBPM(old)).strikethrough().foregroundStyle(.secondary)
                     }
-                    TextField("", text: model.bpmBinding(item.id))
-                        .foregroundStyle(item.bpmChanged ? .orange : item.isSuspicious ? .yellow : .primary)
-                        .multilineTextAlignment(.trailing)
+                    if let label = model.tempoLabel(item.id) {
+                        Text(label).foregroundStyle(.orange).help("Cambio de tempo detectado (pendiente de guardar)")
+                    } else {
+                        TextField("", text: model.bpmBinding(item.id))
+                            .foregroundStyle(item.bpmChanged || item.gridEdited ? .orange : item.isSuspicious ? .yellow : .primary)
+                            .multilineTextAlignment(.trailing)
+                    }
                 }
             }
             .width(min: 70, ideal: 100)
@@ -215,6 +235,19 @@ struct TrackTable: View {
                 player.play(url)
             } else {
                 player.toggle()
+            }
+            return .handled
+        }
+        .onKeyPress(characters: CharacterSet(charactersIn: "12345678")) { press in
+            // Igual que los pads: si el cue existe salta; si está vacío lo pone aquí.
+            guard !isEditingText, let url = player.url, let n = Int(press.characters) else { return .ignored }
+            let perf = model.performance(for: url)
+            if let cue = perf?.hotCues.first(where: { $0.index == n - 1 }) {
+                player.jump(to: cue.seconds)
+            } else {
+                let quantize = UserDefaults.standard.object(forKey: "deckQuantize") as? Bool ?? true
+                let t = player.now
+                model.setHotCue(n - 1, at: quantize ? (perf?.quantize(t) ?? t) : t, in: url)
             }
             return .handled
         }
@@ -266,12 +299,36 @@ struct StatusBar: View {
                     .foregroundStyle(.yellow)
             }
             Spacer()
-            if model.isSaving { ProgressView().controlSize(.small) }
+            RekordboxStatus()
+            if let p = model.analysisProgress {
+                ProgressView(value: Double(p.done), total: Double(p.total)).frame(width: 80)
+                Text("Analizando \(p.done)/\(p.total)").monospacedDigit()
+            }
+            if model.isSaving || model.isExporting { ProgressView().controlSize(.small) }
             if let msg = model.message { Text(msg).lineLimit(1) }
         }
         .font(.callout)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(.bar)
+    }
+}
+
+/// Estado del rekordbox.xml en la barra inferior.
+struct RekordboxStatus: View {
+    @Environment(LibraryModel.self) private var model
+
+    var body: some View {
+        Group {
+            if !model.rekordboxConfigured {
+                Button("rekordbox sin configurar") { model.configureRekordbox() }
+                    .buttonStyle(.link)
+                    .help("Apunta rekordbox a este XML (con rekordbox cerrado)")
+            } else if let date = model.lastRekordboxExport {
+                Label("rekordbox.xml \(date.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+                    .help(model.autoExportRekordbox ? "Se actualiza solo al guardar o cuando cambia Engine" : "Exportación automática desactivada")
+            }
+        }
     }
 }

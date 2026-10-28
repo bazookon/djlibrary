@@ -13,6 +13,7 @@ struct ByteReader {
     }
 
     mutating func u8() throws -> UInt8 { try take(1).first! }
+    mutating func bytes(_ n: Int) throws -> [UInt8] { Array(try take(n)) }
 
     mutating func u64be() throws -> UInt64 { try take(8).reduce(0) { $0 << 8 | UInt64($1) } }
     mutating func u64le() throws -> UInt64 { try take(8).reversed().reduce(0) { $0 << 8 | UInt64($1) } }

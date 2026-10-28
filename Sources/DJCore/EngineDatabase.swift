@@ -38,6 +38,10 @@ public struct EngineChange {
     public var bpm: Double?
     public var artwork: ArtworkChange?
     public var fileBytes: Int64?
+    /// Hot cues y cue principal a escribir en PerformanceData.quickCues.
+    public var cues: TrackPerformance?
+    /// Tramos de tempo detectados: sustituyen el grid (tiene prioridad sobre `bpm`, que solo fija la lista).
+    public var segments: [TempoSegment]?
 
     public init(trackId: Int64) { self.trackId = trackId }
 }
@@ -163,13 +167,26 @@ public final class EngineDatabase {
         }
         if let bytes = c.fileBytes { try db.exec("UPDATE Track SET fileBytes = ? WHERE id = ?", [.int(bytes), id]) }
 
-        if let bpm = c.bpm {
+        // Tramos detectados: grid con varios marcadores y, en la lista, el BPM de `bpm` o el del primer tramo.
+        if let segments = c.segments, let first = segments.first {
+            let bpm = c.bpm ?? first.bpm
+            try db.exec("UPDATE Track SET bpm = ?, bpmAnalyzed = ? WHERE id = ?",
+                        [.int(Int64(bpm.rounded())), .double(bpm), id])
+            if var beats = try beatData(trackId: c.trackId) {
+                beats.setSegments(segments)
+                try db.exec("UPDATE PerformanceData SET beatData = ? WHERE trackId = ?", [.blob(try beats.encoded()), id])
+            }
+        } else if let bpm = c.bpm {
             try db.exec("UPDATE Track SET bpm = ?, bpmAnalyzed = ? WHERE id = ?",
                         [.int(Int64(bpm.rounded())), .double(bpm), id])
             if var beats = try beatData(trackId: c.trackId) {
                 beats.setConstantBPM(bpm)
                 try db.exec("UPDATE PerformanceData SET beatData = ? WHERE trackId = ?", [.blob(try beats.encoded()), id])
             }
+        }
+
+        if let cues = c.cues {
+            try db.exec("UPDATE PerformanceData SET quickCues = ? WHERE trackId = ?", [.blob(try cues.encodedQuickCues()), id])
         }
 
         switch c.artwork {

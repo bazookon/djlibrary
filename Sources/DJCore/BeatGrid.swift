@@ -92,6 +92,65 @@ public struct BeatData {
         isSet = 1
     }
 
+    /// Grid de Engine a partir de los tramos detectados (uno por cambio de tempo).
+    ///
+    /// Cada tramo mantiene su tempo exacto. Entre el último beat de un tramo y el primero del siguiente va un
+    /// "puente" de 1–4 beats (suele caer en el break) elegido para que el primer "1" del tramo nuevo sea un
+    /// downbeat (número de beat múltiplo de 4, como los compases de Engine).
+    public static func markers(for segments: [TempoSegment], sampleRate sr: Double, totalSamples: Double) -> [BeatMarker] {
+        guard let first = segments.first else { return [] }
+        var markers: [BeatMarker] = []
+        // Numeramos para que el downbeat del primer tramo sea el beat 0.
+        var spb = 60 / first.bpm * sr
+        var beat = Int64(-first.downbeatOffset - 4)
+        var pos = first.firstBeat * sr - 4 * spb
+        markers.append(BeatMarker(position: pos, beat: beat, beatsToNext: 0, unknown: 0))
+
+        for next in segments.dropFirst() {
+            let nextFirst = next.firstBeat * sr
+            // Último beat del tramo actual antes del primer beat del siguiente.
+            let kMax = Int64(((nextFirst - pos) / spb - 0.25).rounded(.down))
+            guard kMax > 0 else { continue }
+            let nextSpb = 60 / next.bpm * sr
+            // Elegimos dónde acaba el tramo (hasta 7 beats antes) y cuántos beats lleva el puente para que
+            // el downbeat del tramo nuevo sea múltiplo de 4 con beats de tamaño lo más normal posible.
+            var best: (k: Int64, n: Int64, error: Double)?
+            for j in 0...7 {
+                let k = kMax - Int64(j)
+                guard k > 0 else { break }
+                let gap = nextFirst - (pos + Double(k) * spb)
+                let natural = max(1, Int64((gap / nextSpb).rounded()))
+                for n in max(1, natural - 2)...(natural + 3) where (beat + k + n + Int64(next.downbeatOffset)) % 4 == 0 {
+                    let error = abs(gap / Double(n) / nextSpb - 1)
+                    if best == nil || error < best!.error { best = (k, n, error) }
+                }
+            }
+            guard let choice = best else { continue }
+            beat += choice.k
+            pos += Double(choice.k) * spb
+            markers.append(BeatMarker(position: pos, beat: beat, beatsToNext: 0, unknown: 0))
+            beat += choice.n
+            pos = nextFirst
+            spb = nextSpb
+            markers.append(BeatMarker(position: pos, beat: beat, beatsToNext: 0, unknown: 0))
+        }
+        // Último marcador pasado el final del audio.
+        let remaining = max(1, Int64(((totalSamples - pos) / spb).rounded(.up)))
+        markers.append(BeatMarker(position: pos + Double(remaining) * spb, beat: beat + remaining, beatsToNext: 0, unknown: 1))
+        for i in 0..<(markers.count - 1) {
+            markers[i].beatsToNext = Int32(markers[i + 1].beat - markers[i].beat)
+        }
+        return markers
+    }
+
+    /// Sustituye el grid ajustado por el de los tramos detectados.
+    public mutating func setSegments(_ segments: [TempoSegment]) {
+        let grid = Self.markers(for: segments, sampleRate: sampleRate, totalSamples: totalSamples)
+        guard grid.count >= 2 else { return }
+        adjustedGrid = grid
+        isSet = 1
+    }
+
     private static func readGrid(_ r: inout ByteReader) throws -> [BeatMarker] {
         let count = try r.i64be()
         guard count >= 0 && count < 100_000 else { throw BeatDataError.corrupt }

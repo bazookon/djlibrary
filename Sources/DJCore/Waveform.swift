@@ -10,16 +10,34 @@ public struct Waveform {
         public let mid: Double
         public let high: Double
         public var amplitude: Double { max(low, mid, high) }
+
+        public init(low: Double, mid: Double, high: Double) {
+            self.low = low
+            self.mid = mid
+            self.high = high
+        }
     }
 
     public let columns: [Column]
+    /// Samples de audio por columna (Engine); 0 si no se sabe.
+    public let samplesPerColumn: Double
+
+    public init(columns: [Column], samplesPerColumn: Double = 0) {
+        self.columns = columns
+        self.samplesPerColumn = samplesPerColumn
+    }
+
+    /// Duración que cubre la onda, si se conoce la frecuencia de muestreo.
+    public func duration(sampleRate: Double) -> Double? {
+        samplesPerColumn > 0 ? Double(columns.count) * samplesPerColumn / sampleRate : nil
+    }
 
     public init(blob: Data) throws {
         let raw = try BeatData.qUncompress(blob)
         var r = ByteReader(raw)
         let count = Int(try r.i64be())
         _ = try r.i64be()
-        _ = try r.f64be()
+        samplesPerColumn = try r.f64be()
         guard count > 0, count < 100_000, raw.count >= 24 + (count + 1) * 3 else { throw BeatDataError.corrupt }
         let base = 24
         // Un único máximo para las tres bandas: así la proporción entre bandas (el color) es la real,

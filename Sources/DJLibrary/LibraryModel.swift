@@ -28,10 +28,14 @@ struct TrackItem: Identifiable {
     var original: Meta
     var edited: Meta
     var error: String?
+    /// Hot cues / cue principal editados en el deck (pendientes de guardar).
+    var cuesEdited = false
+    /// Grid nuevo del motor de BPM (pendiente de guardar).
+    var gridEdited = false
 
     var url: URL { id }
     var filename: String { id.lastPathComponent }
-    var isDirty: Bool { original != edited }
+    var isDirty: Bool { original != edited || cuesEdited || gridEdited }
     var bpmSort: Double { edited.bpm ?? 0 }
     var bpmChanged: Bool { original.bpm != edited.bpm }
 
@@ -63,6 +67,7 @@ final class LibraryModel {
     private var backedUp = false
     @ObservationIgnored private var readDB: EngineDatabase?
     @ObservationIgnored private var waveforms: [Int64: Waveform?] = [:]
+    @ObservationIgnored private var performances: [Int64: TrackPerformance?] = [:]
 
     @ObservationIgnored @AppStorage("libraryRoot") var libraryRootPath = EngineDatabase.defaultLibraryRoot.path
     @ObservationIgnored @AppStorage("writeFileTags") var writeFileTags = true
@@ -80,6 +85,7 @@ final class LibraryModel {
     init() {
         if let data = try? Data(contentsOf: Self.logoURL) { setLogoData(data) }
         load()
+        startWatchingEngine()
     }
 
     // MARK: Carga
@@ -89,10 +95,19 @@ final class LibraryModel {
             let db = try EngineDatabase(libraryRoot: libraryRoot, readOnly: true)
             readDB = db
             waveforms = [:]
+            performances = [:]
             playlists = try db.playlists()
             let tracks = try db.tracks()
             engineTracks = Dictionary(tracks.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-            for t in tracks {
+            duplicateEngineTracks = 0
+            for t in tracks.sorted(by: { $0.id < $1.id }) {
+                // Una sola entrada por archivo físico: Engine tiene alguna pista repetida con otra forma de la ruta.
+                let k = Self.key(t.url)
+                if let first = urlByKey[k], first != t.url {
+                    duplicateEngineTracks += 1
+                    continue
+                }
+                urlByKey[k] = t.url
                 let meta = meta(for: t)
                 if var existing = items[t.url] {
                     existing.engineId = t.id
@@ -119,7 +134,7 @@ final class LibraryModel {
         var urls: [URL]
         switch source {
         case .all, nil:
-            urls = engineTracks.values.map(\.url)
+            urls = Array(Set(engineTracks.values.map { canonical($0.url) }))
         case .files:
             urls = addedFiles
         case .playlist(let id):
@@ -127,7 +142,8 @@ final class LibraryModel {
                let ids = try? db.trackIds(inPlaylist: id) {
                 playlistTrackIds = ids
             }
-            urls = playlistTrackIds.compactMap { engineTracks[$0]?.url }
+            var seen = Set<URL>()
+            urls = playlistTrackIds.compactMap { engineTracks[$0].map { canonical($0.url) } }.filter { seen.insert($0).inserted }
         }
         var list = urls.compactMap { items[$0] }
         let q = search.trimmingCharacters(in: .whitespaces)
@@ -156,14 +172,27 @@ final class LibraryModel {
                 found.append(url.standardizedFileURL)
             }
         }
-        for url in found where !addedFiles.contains(url) {
+        var added = 0, repeated = 0, inEngine = 0
+        for raw in found {
+            // Misma pista aunque llegue con otra forma de la ruta (acentos NFD de Finder, mayúsculas).
+            let k = Self.key(raw)
+            let url = urlByKey[k] ?? raw
+            urlByKey[k] = url
+            if addedFiles.contains(url) { repeated += 1; continue }
             addedFiles.append(url)
+            added += 1
             if items[url] == nil {
                 items[url] = TrackItem(id: url, engineId: nil, original: Meta(), edited: Meta())
                 Task { await loadFileTags(url) }
+            } else if items[url]?.engineId != nil {
+                inEngine += 1
             }
         }
         source = .files
+        var parts = ["Añadidas \(added) pistas"]
+        if inEngine > 0 { parts.append("\(inEngine) ya están en Engine (se editan allí también)") }
+        if repeated > 0 { parts.append("\(repeated) ya estaban en la lista y no se repiten") }
+        message = parts.joined(separator: "; ") + "."
     }
 
     private func loadFileTags(_ url: URL) async {
@@ -185,6 +214,237 @@ final class LibraryModel {
         return w
     }
 
+    /// Cues, loops y grid de Engine de la pista (con los cues editados sin guardar, si los hay).
+    func performance(for url: URL) -> TrackPerformance? {
+        var perf: TrackPerformance?
+        if let edited = cueEdits[url] {
+            perf = edited
+        } else if let id = items[url]?.engineId {
+            if let cached = performances[id] {
+                perf = cached
+            } else {
+                perf = try? readDB?.performance(trackId: id)
+                performances[id] = perf
+            }
+        }
+        // Grid pendiente del motor de BPM: se ve en el deck antes de guardar.
+        if var p = perf, let analysis = gridEdits[url], p.totalSamples > 0 {
+            p.grid = BeatData.markers(for: analysis.segments, sampleRate: p.sampleRate, totalSamples: p.totalSamples)
+            perf = p
+        }
+        return perf
+    }
+
+    // MARK: Motor de BPM
+
+    private(set) var gridEdits: [URL: TempoAnalysis] = [:]
+    private(set) var analysisProgress: (done: Int, total: Int)?
+
+    /// "128 → 98" si el análisis pendiente tiene cambios de tempo.
+    func tempoLabel(_ url: URL) -> String? {
+        guard let a = gridEdits[url], a.segments.count > 1 else { return nil }
+        return a.segments.map { TagWriter.formatBPM($0.bpm) }.joined(separator: " → ")
+    }
+
+    /// Analiza la selección (o todo lo visible) con el motor propio: BPM enteros, cambios de tempo, fase y compás.
+    /// El resultado queda pendiente (naranja) para revisarlo en el deck antes de guardar.
+    func analyzeBPM() async {
+        let urls = (targets.isEmpty ? visible.map(\.id) : visible.map(\.id).filter { targets.contains($0) })
+        guard !urls.isEmpty, analysisProgress == nil else { return }
+        analysisProgress = (0, urls.count)
+        var failed = 0
+        await withTaskGroup(of: (URL, TempoAnalysis?).self) { group in
+            var queue = urls[...]
+            for _ in 0..<min(4, queue.count) {
+                let url = queue.removeFirst()
+                group.addTask { (url, try? TempoDetector.analyze(url: url)) }
+            }
+            for await (url, result) in group {
+                if let result, let first = result.segments.first {
+                    gridEdits[url] = result
+                    items[url]?.gridEdited = true
+                    items[url]?.edited.bpm = first.bpm
+                    items[url]?.error = nil
+                } else {
+                    failed += 1
+                    items[url]?.error = "No se pudo analizar el audio"
+                }
+                analysisProgress = (analysisProgress?.done ?? 0) + 1 == urls.count ? nil : ((analysisProgress?.done ?? 0) + 1, urls.count)
+                if let next = queue.popFirst() {
+                    group.addTask { (next, try? TempoDetector.analyze(url: next)) }
+                }
+            }
+        }
+        analysisProgress = nil
+        refreshVisible()
+        let changes = urls.filter { items[$0]?.isDirty == true }.count
+        let transitions = urls.filter { (gridEdits[$0]?.segments.count ?? 0) > 1 }.count
+        message = "Analizadas \(urls.count) pistas: \(changes) con cambios, \(transitions) con cambio de tempo"
+            + (failed > 0 ? ", \(failed) sin poder leer." : ". Revísalas en el deck y guarda.")
+    }
+
+    /// Un cambio manual de BPM descarta el grid del motor (se vuelve a un grid constante).
+    private func dropAnalysis(_ ids: Set<URL>) {
+        for id in ids {
+            gridEdits[id] = nil
+            items[id]?.gridEdited = false
+        }
+    }
+
+    // MARK: Deck
+
+    private(set) var cueEdits: [URL: TrackPerformance] = [:]
+    private(set) var detail: (url: URL, waveform: DetailWaveform)?
+
+    /// Calcula la onda detallada de la pista que suena (0,1–0,3 s) para la vista con zoom.
+    func loadDetail(for url: URL) async {
+        guard detail?.url != url else { return }
+        let w = try? await Task.detached { try DetailWaveform.compute(url: url) }.value
+        if let w { detail = (url, w) }
+    }
+
+    func editCues(_ url: URL, _ change: (inout TrackPerformance) -> Void) {
+        guard var p = performance(for: url), items[url]?.engineId != nil else {
+            message = "Los cues solo se pueden editar en pistas de Engine."
+            return
+        }
+        change(&p)
+        cueEdits[url] = p
+        items[url]?.cuesEdited = true
+        refreshVisible()
+    }
+
+    func setHotCue(_ index: Int, at seconds: Double, in url: URL) {
+        editCues(url) { p in
+            if let i = p.hotCues.firstIndex(where: { $0.index == index }) {
+                p.hotCues[i].seconds = seconds
+            } else {
+                p.hotCues.append(.new(index: index, seconds: seconds))
+            }
+        }
+    }
+
+    func deleteHotCue(_ index: Int, in url: URL) {
+        editCues(url) { $0.hotCues.removeAll { $0.index == index } }
+    }
+
+    func setMainCue(at seconds: Double, in url: URL) {
+        editCues(url) { $0.mainCue = seconds }
+    }
+
+    // MARK: rekordbox
+
+    @ObservationIgnored @AppStorage("rekordboxXML") var rekordboxXMLPath = RekordboxExport.defaultURL.path
+    @ObservationIgnored @AppStorage("autoExportRekordbox") var autoExportRekordbox = true
+    var isExporting = false
+    private(set) var lastRekordboxExport: Date?
+    private(set) var rekordboxConfigured = false
+    @ObservationIgnored private var lastDBStamp: Date?
+    @ObservationIgnored private var watchTimer: Timer?
+
+    /// Exporta lo que hay guardado en Engine (los cambios sin guardar no entran).
+    func exportRekordbox(quiet: Bool = false) async {
+        guard !isExporting else { return }
+        isExporting = true
+        defer { isExporting = false }
+        let root = libraryRoot
+        let dest = URL(fileURLWithPath: rekordboxXMLPath)
+        do {
+            let s = try await Task.detached {
+                try RekordboxExport.export(from: EngineDatabase(libraryRoot: root, readOnly: true), to: dest)
+            }.value
+            lastRekordboxExport = Date()
+            if !quiet {
+                message = "rekordbox.xml: \(s.tracks) pistas, \(s.playlists) playlists, \(s.cues) hot cues."
+                    + (dirtyCount > 0 ? " Los cambios sin guardar no están incluidos." : "")
+            }
+        } catch {
+            message = "No se pudo exportar a rekordbox: \(error.localizedDescription)"
+        }
+    }
+
+    /// Fecha de la última escritura en la base de Engine (m.db o su journal).
+    private func engineDBStamp() -> Date? {
+        let db = EngineDatabase.databaseURL(libraryRoot: libraryRoot)
+        return [db.path, db.path + "-journal"]
+            .compactMap { try? FileManager.default.attributesOfItem(atPath: $0)[.modificationDate] as? Date }
+            .max()
+    }
+
+    /// Vigila la base de Engine: si cambia (desde Engine o desde aquí), recarga la tabla
+    /// y actualiza rekordbox.xml. Al arrancar, exporta si el XML es más viejo que la base.
+    func startWatchingEngine() {
+        refreshRekordboxConfigured()
+        lastDBStamp = engineDBStamp()
+        if autoExportRekordbox {
+            let xmlDate = (try? FileManager.default.attributesOfItem(atPath: rekordboxXMLPath)[.modificationDate]) as? Date
+            if let db = lastDBStamp, xmlDate.map({ $0 < db }) ?? true {
+                Task { await exportRekordbox(quiet: true) }
+            } else {
+                lastRekordboxExport = xmlDate
+            }
+        }
+        watchTimer?.invalidate()
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.checkEngineChanges() }
+        }
+    }
+
+    private func checkEngineChanges() async {
+        refreshRekordboxConfigured()
+        guard !isSaving, let stamp = engineDBStamp(), stamp != lastDBStamp else { return }
+        // Esperamos a que Engine deje de escribir unos segundos antes de leer.
+        guard Date().timeIntervalSince(stamp) > 8 else { return }
+        lastDBStamp = stamp
+        if dirtyCount == 0 { load() }
+        if autoExportRekordbox { await exportRekordbox(quiet: true) }
+    }
+
+    var rekordboxIsRunning: Bool {
+        NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == RekordboxSettings.bundleIdentifier }
+    }
+
+    func refreshRekordboxConfigured() {
+        rekordboxConfigured = RekordboxSettings.isConfigured(xmlPath: rekordboxXMLPath)
+    }
+
+    /// Apunta rekordbox a nuestro XML y muestra «rekordbox xml» en su barra lateral.
+    func configureRekordbox() {
+        guard !rekordboxIsRunning else {
+            message = "Cierra rekordbox para configurarlo (guarda sus preferencias al salir y pisaría el cambio)."
+            return
+        }
+        do {
+            try RekordboxSettings.configure(xmlPath: rekordboxXMLPath)
+            refreshRekordboxConfigured()
+            message = "rekordbox configurado: al abrirlo verás «rekordbox xml» en la barra lateral."
+        } catch {
+            message = "No se pudo configurar rekordbox: \(error.localizedDescription)"
+        }
+    }
+
+    func openRekordbox() {
+        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: RekordboxSettings.bundleIdentifier) else {
+            message = "No encuentro rekordbox en Aplicaciones."
+            return
+        }
+        NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    // MARK: Identidad de archivos
+
+    /// Primera URL vista para cada archivo físico (clave normalizada).
+    @ObservationIgnored private var urlByKey: [String: URL] = [:]
+    private(set) var duplicateEngineTracks = 0
+
+    /// Clave de un archivo: ruta absoluta en forma Unicode compuesta (Engine guarda NFC, Finder entrega NFD)
+    /// y en minúsculas (APFS no distingue mayúsculas).
+    static func key(_ url: URL) -> String {
+        url.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+    }
+
+    func canonical(_ url: URL) -> URL { urlByKey[Self.key(url)] ?? url }
+
     // MARK: Edición
 
     func binding(_ id: URL, _ path: WritableKeyPath<Meta, String>) -> Binding<String> {
@@ -198,6 +458,7 @@ final class LibraryModel {
             get: { self.items[id]?.edited.bpm.map(TagWriter.formatBPM) ?? "" },
             set: { text in
                 if let v = Double(text.replacingOccurrences(of: ",", with: ".")), v > 20, v < 400 {
+                    self.dropAnalysis([id])
                     self.modify([id]) { $0.edited.bpm = v }
                 }
             })
@@ -218,15 +479,32 @@ final class LibraryModel {
         refreshVisible()
     }
 
-    func scaleBPM(_ factor: Double) { modify(targets) { if let b = $0.edited.bpm { $0.edited.bpm = b * factor } } }
-    func roundBPM() { modify(targets) { if let b = $0.edited.bpm { $0.edited.bpm = b.rounded() } } }
-    func setBPM(_ value: Double) { modify(targets) { $0.edited.bpm = value } }
+    func scaleBPM(_ factor: Double) {
+        dropAnalysis(targets)
+        modify(targets) { if let b = $0.edited.bpm { $0.edited.bpm = b * factor } }
+    }
+    func roundBPM() {
+        dropAnalysis(targets)
+        modify(targets) { if let b = $0.edited.bpm { $0.edited.bpm = b.rounded() } }
+    }
+    func setBPM(_ value: Double) {
+        dropAnalysis(targets)
+        modify(targets) { $0.edited.bpm = value }
+    }
     func clearAlbum() { modify(targets) { $0.edited.album = "" } }
     func clearGenre() { modify(targets) { $0.edited.genre = "" } }
     func genreFromFolder() { modify(targets) { if let g = FolderGenre.genre(for: $0.url) { $0.edited.genre = g } } }
     func setLogo() { modify(targets) { $0.edited.art = .logo } }
     func removeArt() { modify(targets) { $0.edited.art = .none } }
-    func revert() { modify(targets.isEmpty ? Set(items.keys) : targets) { $0.edited = $0.original } }
+    func revert() {
+        let ids = targets.isEmpty ? Set(items.keys) : targets
+        for id in ids { cueEdits[id] = nil }
+        dropAnalysis(ids)
+        modify(ids) {
+            $0.edited = $0.original
+            $0.cuesEdited = false
+        }
+    }
 
     func fromFilename() {
         modify(targets) {
@@ -321,7 +599,12 @@ final class LibraryModel {
                 }
             }
 
-            if writeFileTags {
+            if item.cuesEdited { change.cues = cueEdits[item.id] }
+            if item.gridEdited { change.segments = gridEdits[item.id]?.segments }
+
+            let hasTagEdits = edits.title != nil || edits.artist != nil || edits.clearAlbum || edits.genre != nil
+                || edits.bpm != nil || edits.artwork != nil
+            if writeFileTags && hasTagEdits {
                 do {
                     change.fileBytes = try await TagWriter.write(item.url, edits)
                 } catch TagError.unsupported {
@@ -347,8 +630,19 @@ final class LibraryModel {
                 return
             }
         }
+        for item in dirty where items[item.id]?.error == nil {
+            items[item.id]?.cuesEdited = false
+            cueEdits[item.id] = nil
+            items[item.id]?.gridEdited = false
+            gridEdits[item.id] = nil
+        }
         load()
         let saved = dirty.count - failures
         message = failures == 0 ? "Guardadas \(saved) pistas." : "Guardadas \(saved) pistas; \(failures) con error (en rojo)."
+        if autoExportRekordbox && !changes.isEmpty {
+            lastDBStamp = engineDBStamp()  // ya exportamos aquí; que el vigilante no repita
+            await exportRekordbox(quiet: true)
+            message = (message ?? "") + " rekordbox.xml actualizado."
+        }
     }
 }

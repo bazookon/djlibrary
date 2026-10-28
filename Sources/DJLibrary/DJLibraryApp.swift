@@ -28,6 +28,9 @@ struct DJLibraryApp: App {
                 }
                     .keyboardShortcut("s")
                     .disabled(model.dirtyCount == 0 || model.isSaving)
+                Button("Exportar a rekordbox") { Task { await model.exportRekordbox() } }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(model.isExporting)
             }
         }
 
